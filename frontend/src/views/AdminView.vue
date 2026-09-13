@@ -38,7 +38,7 @@
         <p class="card-hint-inline">序号 #1、#2… 横向排列可换行；删除某张后序号自动连续，无跳跃。</p>
         <div class="key-grid">
           <div
-            v-for="r in existingRecords"
+            v-for="r in sortedRecords"
             :key="r.id"
             class="key-tile"
           >
@@ -169,9 +169,14 @@ const resultQrUrl = ref('')
 const previewVisible = ref(false)
 const previewUrl = ref('')
 
+// 展示前本地兜底排序：无论接口返回顺序如何，#key 始终按 1、2、3… 连续展示
+const sortedRecords = computed(() =>
+  [...existingRecords.value].sort((a, b) => (a.sequence_key - b.sequence_key) || (a.id - b.id))
+)
+
 const nextKey = computed(() => {
-  if (existingRecords.value.length === 0) return 1
-  const max = Math.max(...existingRecords.value.map((r) => r.sequence_key))
+  if (sortedRecords.value.length === 0) return 1
+  const max = Math.max(...sortedRecords.value.map((r) => r.sequence_key))
   return max + 1
 })
 

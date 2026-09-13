@@ -6,6 +6,7 @@ use app\model\Record;
 use app\model\User;
 use app\service\QrService;
 use app\service\RecordSequenceService;
+use think\facade\Db;
 use think\facade\Log;
 use think\facade\Request;
 use think\Response;
@@ -62,7 +63,7 @@ class RecordController
             if ($status) {
                 $query->where('status', $status);
             }
-            $list = $query->order('sequence_key', 'asc')->select();
+            $list = $query->order('sequence_key', 'asc')->order('id', 'asc')->select();
             return api_json(['code' => 0, 'message' => 'ok', 'data' => $list->toArray()]);
         } catch (\Throwable $e) {
             $msg = $e->getMessage();
@@ -87,49 +88,60 @@ class RecordController
                 return api_json(['code' => 404, 'message' => '用户不存在', 'data' => null]);
             }
             $checkDate = (string) Request::param('check_date') ?: date('Y-m-d');
-            $startKey = $this->seq()->getNextSequenceKey($userId, $checkDate);
 
-            // 预取检查项，用于写入快照，避免后续修改 inspection_items 造成历史漂移
-            $itemIds = [];
+            // 先过滤无效项再统一编号：key 只发给真正入库的记录，从源头杜绝跳号
+            $validItems = [];
             foreach ($items as $item) {
                 $itemId = (int) ($item['item_id'] ?? 0);
-                if ($itemId) {
-                    $itemIds[] = $itemId;
+                $issueImage = (string) ($item['issue_image'] ?? '');
+                if ($itemId && $issueImage) {
+                    $validItems[] = ['item_id' => $itemId, 'issue_image' => $issueImage];
                 }
             }
-            $itemMap = [];
-            if (!empty($itemIds)) {
-                $rows = InspectionItem::whereIn('id', array_values(array_unique($itemIds)))->select();
-                foreach ($rows as $row) {
-                    $itemMap[(int) $row->id] = $row;
-                }
+            if (empty($validItems)) {
+                return api_json(['code' => 400, 'message' => '没有可保存的有效记录', 'data' => null]);
             }
 
-            $created = [];
-            foreach ($items as $i => $item) {
-                $itemId = (int) ($item['item_id'] ?? 0);
-                $issueImage = (string) ($item['issue_image'] ?? '');
-                if (!$itemId || !$issueImage) {
-                    continue;
-                }
-                $snapName = null;
-                $snapScore = null;
-                if (isset($itemMap[$itemId])) {
-                    $snapName = (string) $itemMap[$itemId]->name;
-                    $snapScore = (int) $itemMap[$itemId]->score;
-                }
-                $record = Record::create([
-                    'user_id'      => $userId,
-                    'item_id'      => $itemId,
-                    'item_name_snapshot'  => $snapName,
-                    'item_score_snapshot' => $snapScore,
-                    'sequence_key' => $startKey + $i,
-                    'issue_image'  => $issueImage,
-                    'status'       => 'pending',
-                    'check_date'   => $checkDate,
-                ]);
-                $created[] = Record::with(['item'])->find($record->id)->toArray();
+            // 预取检查项，用于写入快照，避免后续修改 inspection_items 造成历史漂移
+            $itemIds = array_values(array_unique(array_column($validItems, 'item_id')));
+            $itemMap = [];
+            $rows = InspectionItem::whereIn('id', $itemIds)->select();
+            foreach ($rows as $row) {
+                $itemMap[(int) $row->id] = $row;
             }
+
+            // 事务 + 锁员工行：取 max 与写入原子化，单张/分批并发上传都不会重号
+            $createdIds = Db::transaction(function () use ($userId, $checkDate, $validItems, $itemMap) {
+                $this->seq()->lockUser($userId);
+                $nextKey = $this->seq()->getNextSequenceKey($userId, $checkDate);
+                $ids = [];
+                foreach ($validItems as $item) {
+                    $itemId = $item['item_id'];
+                    $snapName = null;
+                    $snapScore = null;
+                    if (isset($itemMap[$itemId])) {
+                        $snapName = (string) $itemMap[$itemId]->name;
+                        $snapScore = (int) $itemMap[$itemId]->score;
+                    }
+                    $record = Record::create([
+                        'user_id'      => $userId,
+                        'item_id'      => $itemId,
+                        'item_name_snapshot'  => $snapName,
+                        'item_score_snapshot' => $snapScore,
+                        'sequence_key' => $nextKey,
+                        'issue_image'  => $item['issue_image'],
+                        'status'       => 'pending',
+                        'check_date'   => $checkDate,
+                    ]);
+                    $nextKey++;
+                    $ids[] = (int) $record->id;
+                }
+                return $ids;
+            });
+
+            $created = Record::with(['item'])->whereIn('id', $createdIds)
+                ->order('sequence_key', 'asc')->order('id', 'asc')
+                ->select()->toArray();
 
             // 可选：同一步生成“带 token 链接 + 唯一二维码”
             if ($baseUrl !== '') {
@@ -158,11 +170,15 @@ class RecordController
             if (!$record) {
                 return api_json(['code' => 404, 'message' => '记录不存在', 'data' => null]);
             }
-            $userId = $record->user_id;
-            $seqKey = $record->sequence_key;
+            $userId = (int) $record->user_id;
+            $seqKey = (int) $record->sequence_key;
             $checkDate = $record->check_date ? (string) $record->check_date : null;
-            $record->delete();
-            $this->seq()->reorderAfterDelete($userId, $seqKey, $checkDate);
+            // 删除与重排同一事务 + 员工行锁：要么一起成功，要么一起回滚，绝不留下空洞
+            Db::transaction(function () use ($record, $userId, $seqKey, $checkDate) {
+                $this->seq()->lockUser($userId);
+                $record->delete();
+                $this->seq()->reorderAfterDelete($userId, $seqKey, $checkDate);
+            });
             return api_json(['code' => 0, 'message' => 'ok', 'data' => null]);
         } catch (\Throwable $e) {
             Log::error('RecordController@delete: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
