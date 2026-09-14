@@ -54,6 +54,14 @@ docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backen
 
 脚本会为 `records.check_date` 赋值：优先取 `created_at` 的日期部分，缺失时使用当前日期。
 
+若历史数据中同一员工、同一天的问题图序号出现跳号（如 `#1、#2、#4`，旧版保存逻辑遗留），可执行压缩脚本，将序号按顺序重排为连续的 `1、2、3…`：
+
+```bash
+docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backend/database/migrate_compact_sequence.sql
+```
+
+脚本可重复执行；不执行也不影响使用——删除任意一条记录后，系统会自动把该员工当天的剩余序号压缩为连续序列。
+
 ## Docker 说明
 
 - 数据库使用 `utf8mb4` 字符集，连接时指定 charset。

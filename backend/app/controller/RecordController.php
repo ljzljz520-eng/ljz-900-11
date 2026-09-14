@@ -171,13 +171,13 @@ class RecordController
                 return api_json(['code' => 404, 'message' => '记录不存在', 'data' => null]);
             }
             $userId = (int) $record->user_id;
-            $seqKey = (int) $record->sequence_key;
             $checkDate = $record->check_date ? (string) $record->check_date : null;
             // 删除与重排同一事务 + 员工行锁：要么一起成功，要么一起回滚，绝不留下空洞
-            Db::transaction(function () use ($record, $userId, $seqKey, $checkDate) {
+            Db::transaction(function () use ($record, $userId, $checkDate) {
                 $this->seq()->lockUser($userId);
                 $record->delete();
-                $this->seq()->reorderAfterDelete($userId, $seqKey, $checkDate);
+                // 存量数据可能因旧版逻辑本就有洞（如 [1,2,4]），删除后整体压缩为连续序号
+                $this->seq()->reorderAfterDelete($userId, $checkDate);
             });
             return api_json(['code' => 0, 'message' => 'ok', 'data' => null]);
         } catch (\Throwable $e) {

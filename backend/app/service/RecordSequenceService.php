@@ -33,17 +33,34 @@ class RecordSequenceService
     }
 
     /**
-     * 删除后重排：比被删序号大的记录整体前移一位，保证 #1、#2… 连续 无跳号。
-     * 单条原子 UPDATE，须在事务内（与 delete 同一事务）调用。
+     * 删除后压缩重排：把该「员工 + 检查日期」分组内剩余记录的序号
+     * 按 sequence_key、id 顺序整体重写为 1、2、3… 的连续序列。
+     *
+     * 注意：不能假设旧数据是连续的。旧版保存逻辑可能留下 [1,2,4] 这样的空洞
+     * （如被过滤的无效项也占了号）。此时若只把“大于被删序号”的 key 减 1：
+     * 删除 #1 会得到 [1,3]，#1 仍在且仍然跳号。
+     * 整体压缩无论存量数据是否有洞，删除后都保证 1..n 连续。
+     * 单条循环 UPDATE，须在事务内（与 delete 同一事务）、lockUser() 之后调用。
      */
-    public function reorderAfterDelete(int $userId, int $deletedSequenceKey, ?string $checkDate = null): void
+    public function reorderAfterDelete(int $userId, ?string $checkDate = null): void
     {
-        $query = Record::where('user_id', $userId)->where('sequence_key', '>', $deletedSequenceKey);
+        $query = Record::where('user_id', $userId);
         if ($checkDate) {
             $query->where('check_date', $checkDate);
         } else {
+            // 历史无日期数据自成一组，不跨日期重排
             $query->whereNull('check_date');
         }
-        $query->dec('sequence_key', 1)->update();
+        $remaining = $query->order('sequence_key', 'asc')->order('id', 'asc')
+            ->field('id,sequence_key')->select();
+
+        $key = 1;
+        foreach ($remaining as $row) {
+            // 只写真正变化的行，避免无意义 UPDATE；前面有洞时后续行也会被一并拉平
+            if ((int) $row->sequence_key !== $key) {
+                Record::where('id', $row->id)->update(['sequence_key' => $key]);
+            }
+            $key++;
+        }
     }
 }
