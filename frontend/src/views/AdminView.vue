@@ -35,7 +35,7 @@
           </span>
           <h2 class="card-title">已有问题图片（#key + 检查项 + 扣分）</h2>
         </div>
-        <p class="card-hint-inline">序号 #1、#2… 横向排列可换行；删除某张后序号自动连续，无跳跃。</p>
+        <p class="card-hint-inline">序号 #1、#2… 在同一员工下全局连续（跨检查日期）；删除某张后序号自动重排，无跳跃。</p>
         <div class="key-grid">
           <div
             v-for="r in existingRecords"
@@ -162,16 +162,18 @@ const users = ref([])
 const inspectionItems = ref([])
 const selectedUserId = ref(null)
 const selectedDate = ref(new Date())
-const existingRecords = ref([])
+const allRecords = ref([]) // 该员工全部检查记录：用于计算全局下一个序号
+const existingRecords = ref([]) // 当前检查日期筛选后的记录
 const fileList = ref([])
 const resultLink = ref('')
 const resultQrUrl = ref('')
 const previewVisible = ref(false)
 const previewUrl = ref('')
 
+// 同一员工维度全局连续：下一个序号取该员工所有记录的最大序号 + 1（跨检查日期也连续）
 const nextKey = computed(() => {
-  if (existingRecords.value.length === 0) return 1
-  const max = Math.max(...existingRecords.value.map((r) => r.sequence_key))
+  if (allRecords.value.length === 0) return 1
+  const max = Math.max(...allRecords.value.map((r) => r.sequence_key))
   return max + 1
 })
 
@@ -199,16 +201,19 @@ function formatDate(date) {
 
 async function loadRecords() {
   if (!selectedUserId.value) {
+    allRecords.value = []
     existingRecords.value = []
     return
   }
   try {
-    const list = await api.getRecords({
-      user_id: selectedUserId.value,
-      check_date: formatDate(selectedDate.value),
-    })
-    existingRecords.value = list || []
+    // 拉取该员工全部记录：序号在员工维度全局连续（跨检查日期），下一个序号须取全局最大值
+    const list = await api.getRecords({ user_id: selectedUserId.value })
+    allRecords.value = list || []
+    const day = formatDate(selectedDate.value)
+    // 列表展示仍按所选检查日期筛选；check_date 为 YYYY-MM-DD 字符串
+    existingRecords.value = (list || []).filter((r) => !day || String(r.check_date || '').slice(0, 10) === day)
   } catch (_) {
+    allRecords.value = []
     existingRecords.value = []
   }
 }

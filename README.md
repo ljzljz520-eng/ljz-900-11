@@ -46,13 +46,27 @@
 docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backend/database/migrate_add_auth.sql
 ```
 
-若需要为历史记录补充「检查日期」字段（用于按天编号与筛选），可执行：
+若需要为历史记录补充「检查日期」字段（用于按天筛选），可执行：
 
 ```bash
 docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backend/database/migrate_add_check_date.sql
 ```
 
 脚本会为 `records.check_date` 赋值：优先取 `created_at` 的日期部分，缺失时使用当前日期。
+
+若数据库是早期版本（序号曾按「员工 + 检查日期」分别编号，跨天后员工端/汇总页会出现重复的 #1、#2），请执行序号统一迁移：
+
+```bash
+docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backend/database/migrate_sequence_per_user.sql
+```
+
+脚本会先把每名员工的历史记录按（检查日期、旧序号、id）压实为从 1 开始的**全局连续序号**，再把 `(user_id, sequence_key)` 升级为唯一索引（防止并发重号）。可重复执行。
+
+## 序号（key）规则
+
+- 编号在**同一员工下全局连续**（跨检查日期），从已有最大序号继续生成 #1、#2…，单张上传与分批上传规则一致。
+- 删除某张问题图后，后续序号自动整体前移一位，展示始终连续、不跳号。
+- 并发保存/删除由员工级咨询锁串行化，并由数据库唯一索引兜底。
 
 ## Docker 说明
 

@@ -11,7 +11,7 @@ class SummaryController
     {
         try {
             $users = User::where('role', 'employee')->with(['records' => function ($q) {
-                $q->with('item')->order('sequence_key', 'asc');
+                $q->with('item')->order('check_date', 'asc')->order('sequence_key', 'asc');
             }])->select();
             $data = [];
             foreach ($users as $user) {
