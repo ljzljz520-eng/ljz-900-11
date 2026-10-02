@@ -54,6 +54,14 @@ docker exec -i <mysql_container_name> mysql -uroot -proot hygiene_audit < backen
 
 脚本会为 `records.check_date` 赋值：优先取 `created_at` 的日期部分，缺失时使用当前日期。
 
+若需要加固问题图的 `#key` 序号（单张/分批并发上传不重号、删除后严格连续），可执行序号迁移脚本。脚本会先把历史序号按「员工 + 检查日期」紧凑重排为 1..N（修复既有空洞/重复），再增加唯一索引 `uk_user_date_seq (user_id, check_date, sequence_key)`：
+
+```bash
+docker compose exec -T db mysql -uroot -proot hygiene_audit < backend/database/migrate_sequence_keys.sql
+```
+
+> 全新初始化的数据库（`init.sql`）已内置该唯一索引，仅老库升级需要手动执行。
+
 ## Docker 说明
 
 - 数据库使用 `utf8mb4` 字符集，连接时指定 charset。

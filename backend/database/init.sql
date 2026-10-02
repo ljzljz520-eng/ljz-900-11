@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS `records` (
   `check_date` date DEFAULT NULL,
   `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `user_sequence` (`user_id`,`sequence_key`),
+  UNIQUE KEY `uk_user_date_seq` (`user_id`,`check_date`,`sequence_key`),
   KEY `user_id` (`user_id`),
   KEY `item_id` (`item_id`),
   KEY `user_check_date` (`user_id`, `check_date`)

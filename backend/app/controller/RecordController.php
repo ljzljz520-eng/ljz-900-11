@@ -9,6 +9,7 @@ use app\service\RecordSequenceService;
 use think\facade\Log;
 use think\facade\Request;
 use think\Response;
+use think\facade\Db;
 class RecordController
 {
     protected function seq(): RecordSequenceService
@@ -30,6 +31,20 @@ class RecordController
             return '__INVALID__';
         }
         return $checkDate;
+    }
+
+    /**
+     * 是否为可重试的并发冲突：
+     * - 1062：唯一键冲突（(user_id, check_date, sequence_key)）
+     * - 1213/1205：死锁 / 锁等待超时
+     */
+    private function isRetryableConflict(\Throwable $e): bool
+    {
+        $msg = $e->getMessage();
+        return str_contains($msg, '1062')
+            || str_contains($msg, '1213')
+            || str_contains($msg, '1205')
+            || str_contains($msg, '40001');
     }
 
     public function index(): Response
@@ -62,7 +77,7 @@ class RecordController
             if ($status) {
                 $query->where('status', $status);
             }
-            $list = $query->order('sequence_key', 'asc')->select();
+            $list = $query->order('sequence_key', 'asc')->order('id', 'asc')->select();
             return api_json(['code' => 0, 'message' => 'ok', 'data' => $list->toArray()]);
         } catch (\Throwable $e) {
             $msg = $e->getMessage();
@@ -86,49 +101,75 @@ class RecordController
             if (!$user) {
                 return api_json(['code' => 404, 'message' => '用户不存在', 'data' => null]);
             }
-            $checkDate = (string) Request::param('check_date') ?: date('Y-m-d');
-            $startKey = $this->seq()->getNextSequenceKey($userId, $checkDate);
+            $checkDateInput = $this->normalizeCheckDate(Request::param('check_date'));
+            if ($checkDateInput === '__INVALID__') {
+                return api_json(['code' => 400, 'message' => 'check_date 格式错误（应为 YYYY-MM-DD）', 'data' => null]);
+            }
+            $checkDate = $checkDateInput ?: date('Y-m-d');
 
-            // 预取检查项，用于写入快照，避免后续修改 inspection_items 造成历史漂移
-            $itemIds = [];
+            // 过滤掉缺检查项或缺图片的无效项；用有效项数量连续分配序号，避免跳号
+            $validItems = [];
             foreach ($items as $item) {
                 $itemId = (int) ($item['item_id'] ?? 0);
-                if ($itemId) {
-                    $itemIds[] = $itemId;
+                $issueImage = (string) ($item['issue_image'] ?? '');
+                if ($itemId > 0 && $issueImage !== '') {
+                    $validItems[] = ['item_id' => $itemId, 'issue_image' => $issueImage];
                 }
             }
-            $itemMap = [];
-            if (!empty($itemIds)) {
-                $rows = InspectionItem::whereIn('id', array_values(array_unique($itemIds)))->select();
-                foreach ($rows as $row) {
-                    $itemMap[(int) $row->id] = $row;
-                }
+            if (empty($validItems)) {
+                return api_json(['code' => 400, 'message' => '参数错误：缺少有效的检查项或问题图片', 'data' => null]);
             }
 
-            $created = [];
-            foreach ($items as $i => $item) {
-                $itemId = (int) ($item['item_id'] ?? 0);
-                $issueImage = (string) ($item['issue_image'] ?? '');
-                if (!$itemId || !$issueImage) {
-                    continue;
+            // 预取检查项快照（锁外读取，缩短事务时间）
+            $itemIds = array_values(array_unique(array_map(fn ($it) => $it['item_id'], $validItems)));
+            $itemMap = [];
+            $rows = InspectionItem::whereIn('id', $itemIds)->select();
+            foreach ($rows as $row) {
+                $itemMap[(int) $row->id] = $row;
+            }
+
+            $seq = $this->seq();
+
+            // 事务 + 行/间隙锁串行化同一员工的续号；唯一索引冲突时有限重试，
+            // 兜底“该员工当天首批记录”锁不到行的并发场景
+            $created = null;
+            $attempts = 0;
+            while (true) {
+                try {
+                    $created = Db::transaction(function () use ($seq, $userId, $checkDate, $validItems, $itemMap) {
+                        $seq->lockGroup($userId, $checkDate);
+                        [$startKey] = $seq->allocateRange($userId, count($validItems), $checkDate);
+
+                        $out = [];
+                        $offset = 0;
+                        foreach ($validItems as $it) {
+                            $itemId = $it['item_id'];
+                            $snapName = isset($itemMap[$itemId]) ? (string) $itemMap[$itemId]->name : null;
+                            $snapScore = isset($itemMap[$itemId]) ? (int) $itemMap[$itemId]->score : null;
+
+                            $record = Record::create([
+                                'user_id'             => $userId,
+                                'item_id'             => $itemId,
+                                'item_name_snapshot'  => $snapName,
+                                'item_score_snapshot' => $snapScore,
+                                'sequence_key'        => $startKey + $offset,
+                                'issue_image'         => $it['issue_image'],
+                                'status'              => 'pending',
+                                'check_date'          => $checkDate,
+                            ]);
+                            $offset++;
+                            $out[] = Record::with(['item'])->find($record->id)->toArray();
+                        }
+                        return $out;
+                    });
+                    break;
+                } catch (\Throwable $e) {
+                    $attempts++;
+                    if ($attempts >= 3 || !$this->isRetryableConflict($e)) {
+                        throw $e;
+                    }
+                    usleep($attempts * 50000); // 50ms、100ms 后退避重试
                 }
-                $snapName = null;
-                $snapScore = null;
-                if (isset($itemMap[$itemId])) {
-                    $snapName = (string) $itemMap[$itemId]->name;
-                    $snapScore = (int) $itemMap[$itemId]->score;
-                }
-                $record = Record::create([
-                    'user_id'      => $userId,
-                    'item_id'      => $itemId,
-                    'item_name_snapshot'  => $snapName,
-                    'item_score_snapshot' => $snapScore,
-                    'sequence_key' => $startKey + $i,
-                    'issue_image'  => $issueImage,
-                    'status'       => 'pending',
-                    'check_date'   => $checkDate,
-                ]);
-                $created[] = Record::with(['item'])->find($record->id)->toArray();
             }
 
             // 可选：同一步生成“带 token 链接 + 唯一二维码”
@@ -154,17 +195,34 @@ class RecordController
     public function delete(int $id): Response
     {
         try {
-            $record = Record::find($id);
-            if (!$record) {
-                return api_json(['code' => 404, 'message' => '记录不存在', 'data' => null]);
-            }
-            $userId = $record->user_id;
-            $seqKey = $record->sequence_key;
-            $checkDate = $record->check_date ? (string) $record->check_date : null;
-            $record->delete();
-            $this->seq()->reorderAfterDelete($userId, $seqKey, $checkDate);
+            $seq = $this->seq();
+            Db::transaction(function () use ($id, $seq) {
+                // 先普通读取拿到归属（员工 + 日期），随后统一锁区间，
+                // 保证所有写操作按相同顺序加锁，避免并发删除互相死锁
+                $record = Record::find($id);
+                if (!$record) {
+                    throw new \RuntimeException('RECORD_NOT_FOUND');
+                }
+                $userId = (int) $record->user_id;
+                $checkDate = $record->check_date !== null ? (string) $record->check_date : null;
+
+                // 锁定该员工（+日期）的记录区间，与并发的保存/删除串行化
+                $seq->lockGroup($userId, $checkDate);
+
+                // 锁后重读，确认记录未被并发事务删除
+                $record = Record::find($id);
+                if (!$record) {
+                    throw new \RuntimeException('RECORD_NOT_FOUND');
+                }
+                $record->delete();
+                // 对剩余图片整体紧凑重排为 1..N（顺带修复历史空洞/重复）
+                $seq->reindexGroup($userId, $checkDate);
+            });
             return api_json(['code' => 0, 'message' => 'ok', 'data' => null]);
         } catch (\Throwable $e) {
+            if ($e->getMessage() === 'RECORD_NOT_FOUND') {
+                return api_json(['code' => 404, 'message' => '记录不存在', 'data' => null]);
+            }
             Log::error('RecordController@delete: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
             return api_json(['code' => 500, 'message' => '服务器错误', 'data' => null]);
         }
